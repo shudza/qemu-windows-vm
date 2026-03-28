@@ -1,4 +1,6 @@
 #!/bin/bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # ── Configuration (adjust per machine) ──────────────────────────────
 SMP="cores=4,threads=1,sockets=1"
@@ -6,17 +8,16 @@ MEM="8G"
 HUGEPAGES_COUNT=4096          # MEM in 2MB pages (8G = 4096)
 CPU_PINNING="0-3"             # P-cores; empty string to disable pinning
 SMB_PATH="$HOME/projects"    # shared via QEMU SMB
+VIRTIOFS_SHARED="$SCRIPT_DIR/shared"  # shared via virtiofs
 HOST_FORWARDS="hostfwd=tcp::22220-:22,hostfwd=tcp::5000-:5000,hostfwd=tcp::5001-:5001"
 DISK_SIZE="100G"
 # ────────────────────────────────────────────────────────────────────
 
-set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VM_DIR="$SCRIPT_DIR/windows"
 PID_FILE="$VM_DIR/windows.pid"
 LOG_FILE="$VM_DIR/vm.log"
 SPICE_SOCK="$VM_DIR/spice.sock"
+VIRTIOFS_SOCK="$VM_DIR/virtiofs-shared.sock"
 OVMF_VARS="$VM_DIR/OVMF_VARS.4m.fd"
 DISK="$VM_DIR/disk.qcow2"
 
@@ -98,9 +99,11 @@ else
 fi
 
 # ── Build memory args ──────────────────────────────────────────────
-MEM_ARGS="-m $MEM"
+# virtiofs (vhost-user) requires shared memory; use memory-backend objects
 if [ "$USE_HUGEPAGES" -eq 1 ]; then
-    MEM_ARGS="-m $MEM -mem-prealloc -mem-path /dev/hugepages"
+    MEM_ARGS="-m $MEM -object memory-backend-file,id=mem,size=$MEM,mem-path=/dev/hugepages,share=on,prealloc=on -numa node,memdev=mem"
+else
+    MEM_ARGS="-m $MEM -object memory-backend-memfd,id=mem,size=$MEM,share=on -numa node,memdev=mem"
 fi
 
 # ── Build CD-ROM args for fresh install ─────────────────────────────
@@ -123,6 +126,29 @@ TASKSET=""
 if [ -n "$CPU_PINNING" ]; then
     TASKSET="taskset -c $CPU_PINNING"
 fi
+
+# ── Create shared directory & start virtiofsd ────────────────────
+mkdir -p "$VIRTIOFS_SHARED"
+rm -f "$VIRTIOFS_SOCK"
+sudo /usr/lib/virtiofsd \
+    --socket-path="$VIRTIOFS_SOCK" \
+    --shared-dir="$VIRTIOFS_SHARED" \
+    --cache=always \
+    --announce-submounts \
+    --inode-file-handles=mandatory &
+VIRTIOFSD_PID=$!
+
+# Wait for virtiofsd socket
+for i in $(seq 20); do
+    [ -S "$VIRTIOFS_SOCK" ] && break
+    sleep 0.25
+done
+if [ ! -S "$VIRTIOFS_SOCK" ]; then
+    echo "Error: virtiofsd socket not found after 5s"
+    sudo kill "$VIRTIOFSD_PID" 2>/dev/null
+    exit 1
+fi
+sudo chmod 666 "$VIRTIOFS_SOCK"
 
 echo "Starting Windows 10 VM..."
 
@@ -170,6 +196,8 @@ nohup $TASKSET /usr/bin/qemu-system-x86_64 \
     -device hda-micro,audiodev=audio0 \
     -device virtio-net,netdev=nic \
     -netdev user,hostname=windows,${HOST_FORWARDS},smb="$SMB_PATH",id=nic \
+    -chardev socket,id=virtiofs0,path="$VIRTIOFS_SOCK" \
+    -device vhost-user-fs-pci,queue-size=1024,chardev=virtiofs0,tag=shared \
     -drive if=pflash,format=raw,unit=0,file=/usr/share/OVMF/x64/OVMF_CODE.4m.fd,readonly=on \
     -drive if=pflash,format=raw,unit=1,file="$OVMF_VARS" \
     -device virtio-blk-pci,drive=SystemDisk,iothread=iothread0 \
