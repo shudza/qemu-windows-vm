@@ -36,6 +36,11 @@ for i in $(seq "$TIMEOUT"); do
     if ! kill -0 "$PID" 2>/dev/null; then
         echo "VM shut down gracefully."
         rm -f "$PID_FILE"
+        if pgrep -f "virtiofsd.*$VM_DIR" > /dev/null 2>&1; then
+            echo "Stopping virtiofsd..."
+            sudo pkill -f "virtiofsd.*$VM_DIR" 2>/dev/null || true
+        fi
+        rm -f "$VM_DIR/virtiofs-shared.sock"
         exit 0
     fi
     sleep 1
@@ -46,3 +51,10 @@ echo "Timeout reached. Force-killing VM (PID $PID)..."
 kill -9 "$PID" 2>/dev/null || true
 rm -f "$PID_FILE"
 echo "VM force-killed."
+
+# ── Stop virtiofsd ────────────────────────────────────────────────
+if pgrep -f "virtiofsd.*$VM_DIR" > /dev/null 2>&1; then
+    echo "Stopping virtiofsd..."
+    sudo pkill -f "virtiofsd.*$VM_DIR" 2>/dev/null || true
+fi
+rm -f "$VM_DIR/virtiofs-shared.sock"

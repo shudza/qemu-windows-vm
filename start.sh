@@ -164,8 +164,8 @@ nohup $TASKSET /usr/bin/qemu-system-x86_64 \
     -pidfile "$PID_FILE" \
     -rtc base=localtime,clock=host,driftfix=slew \
     -object iothread,id=iothread0 \
-    -device qxl-vga,ram_size_mb=64,vgamem_mb=32,vram_size_mb=64 \
-    -spice unix=on,addr="$SPICE_SOCK",disable-ticketing=on \
+    -device qxl-vga,ram_size_mb=64,vgamem_mb=16,vram_size_mb=64,max_outputs=1 \
+    -spice unix=on,addr="$SPICE_SOCK",disable-ticketing=on,image-compression=off,gl=off,streaming-video=off \
     -display none \
     -device virtio-serial-pci \
     -chardev socket,id=agent0,path="$VM_DIR/windows-agent.sock",server=on,wait=off \
