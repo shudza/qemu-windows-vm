@@ -17,7 +17,7 @@ VIRTIOFSD_BIN=""
 
 # ── Derived paths (set after load_env) ────────────────────────────
 VM_DIR="$SCRIPT_DIR/windows"
-RUN_DIR="${XDG_RUNTIME_DIR:-/run}/windows-vm"
+RUN_DIR="/run/windows-vm"
 PID_FILE="$RUN_DIR/qemu.pid"
 LOG_FILE="$RUN_DIR/vm.log"
 SPICE_SOCK="$RUN_DIR/spice.sock"
@@ -34,8 +34,13 @@ QEMU_STARTED=0
 VIRTIOFSD_PID=""
 ISO_PATH=""
 VIRTIO_ISO=""
+# Real user — for socket ownership (works through sudo and systemd)
+REAL_USER="${SUDO_USER:-$(stat -c %U "$HOME")}"
 
 # ── Functions ─────────────────────────────────────────────────────
+
+# Run command with sudo only if not already root
+as_root() { if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi; }
 
 load_env() {
     if [ -f "$SCRIPT_DIR/.env" ]; then
@@ -211,7 +216,7 @@ setup_hugepages() {
     current=$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages)
     if [ "$current" -lt "$HUGEPAGES_COUNT" ]; then
         echo "Allocating $HUGEPAGES_COUNT hugepages..."
-        echo "$HUGEPAGES_COUNT" | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages > /dev/null
+        echo "$HUGEPAGES_COUNT" | as_root tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages > /dev/null
         local actual
         actual=$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages)
         if [ "$actual" -lt "$HUGEPAGES_COUNT" ]; then
@@ -227,8 +232,8 @@ setup_hugepages() {
 
 start_virtiofsd() {
     mkdir -p "$VIRTIOFS_SHARED"
-    rm -f "$VIRTIOFS_SOCK"
-    sudo "$VIRTIOFSD_BIN" \
+    as_root rm -f "$VIRTIOFS_SOCK"
+    as_root "$VIRTIOFSD_BIN" \
         --socket-path="$VIRTIOFS_SOCK" \
         --shared-dir="$VIRTIOFS_SHARED" \
         --cache=always \
@@ -243,10 +248,10 @@ start_virtiofsd() {
     done
     if [ ! -S "$VIRTIOFS_SOCK" ]; then
         echo "Error: virtiofsd socket not found after 5s"
-        sudo kill "$VIRTIOFSD_PID" 2>/dev/null || true
+        as_root kill "$VIRTIOFSD_PID" 2>/dev/null || true
         exit 1
     fi
-    sudo chmod 666 "$VIRTIOFS_SOCK"
+    as_root chmod 666 "$VIRTIOFS_SOCK"
 }
 
 build_qemu_cmd() {
@@ -385,6 +390,26 @@ launch_vm() {
             "${QEMU_ARGS[@]}" > "$LOG_FILE" 2>&1 &
     fi
 
+    # Wait for QEMU to write the PID file (systemd needs it before we exit)
+    local i
+    for i in $(seq 20); do
+        [ -f "$PID_FILE" ] && break
+        sleep 0.25
+    done
+    if [ ! -f "$PID_FILE" ]; then
+        echo "Error: QEMU failed to start. Check $LOG_FILE" >&2
+        exit 1
+    fi
+
+    # Grant the real user access to the SPICE socket
+    for i in $(seq 20); do
+        [ -S "$SPICE_SOCK" ] && break
+        sleep 0.25
+    done
+    if [ -S "$SPICE_SOCK" ]; then
+        as_root chown "$REAL_USER" "$SPICE_SOCK"
+    fi
+
     QEMU_STARTED=1
 }
 
@@ -399,7 +424,7 @@ launch_viewer() {
         sleep 0.5
     done
     if [ -S "$SPICE_SOCK" ]; then
-        nohup env QT_SCALE_FACTOR=1 remote-viewer --auto-resize=never "spice+unix://$SPICE_SOCK" 2>&1 &
+        nohup remote-viewer --auto-resize=never "spice+unix://$SPICE_SOCK" 2>&1 >/dev/null &
     else
         echo "Warning: SPICE socket not found after 5s. Check $LOG_FILE"
     fi
@@ -423,11 +448,15 @@ EOF
 }
 
 install_systemd() {
+    # Check if VM is running (any instance — manual or systemd)
+    if pgrep -f 'qemu-system-x86_64.*-name windows' > /dev/null 2>&1; then
+        echo "Error: VM is currently running. Shut it down first with ./stop.sh" >&2
+        exit 1
+    fi
+
     local service_file="/etc/systemd/system/windows-vm.service"
-
-    echo "Installing systemd service at $service_file ..."
-
-    sudo tee "$service_file" > /dev/null <<EOF
+    local service_content
+    service_content=$(cat <<EOF
 [Unit]
 Description=Windows QEMU VM
 After=network.target
@@ -438,6 +467,7 @@ Type=forking
 PIDFile=$PID_FILE
 RuntimeDirectory=windows-vm
 Environment=HOME=$HOME
+Environment=SUDO_USER=$REAL_USER
 WorkingDirectory=$SCRIPT_DIR
 
 ExecStart=$SCRIPT_DIR/start.sh --headless
@@ -454,9 +484,19 @@ Restart=no
 [Install]
 WantedBy=multi-user.target
 EOF
+    )
 
-    sudo systemctl daemon-reload
-    sudo systemctl enable windows-vm.service
+    # Check if already installed and identical
+    if [ -f "$service_file" ] && [ "$(as_root cat "$service_file")" = "$service_content" ]; then
+        echo "Systemd service already up to date."
+    else
+        echo "Installing systemd service at $service_file ..."
+        echo "$service_content" | as_root tee "$service_file" > /dev/null
+        as_root systemctl daemon-reload
+    fi
+
+    as_root systemctl enable windows-vm.service 2>/dev/null
+    install_desktop
     echo "Service installed and enabled."
     echo "  Start:   sudo systemctl start windows-vm"
     echo "  Status:  sudo systemctl status windows-vm"
@@ -466,30 +506,42 @@ EOF
 cleanup() {
     if [ "$QEMU_STARTED" -eq 0 ] && [ -n "$VIRTIOFSD_PID" ]; then
         echo "QEMU failed to start. Cleaning up virtiofsd..."
-        sudo kill "$VIRTIOFSD_PID" 2>/dev/null || true
-        rm -f "$VIRTIOFS_SOCK"
+        as_root kill "$VIRTIOFSD_PID" 2>/dev/null || true
+        as_root rm -f "$VIRTIOFS_SOCK"
     fi
 }
 
 main() {
     load_env
     parse_args "$@"
-    detect_paths
-    check_deps
-    mkdir -p "$RUN_DIR"
 
     # If already running, just open the viewer
+    local running_pid=""
     if [ -f "$PID_FILE" ]; then
-        if kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-            if [ "$HEADLESS" -eq 0 ]; then
-                nohup env QT_SCALE_FACTOR=1 remote-viewer --auto-resize=never "spice+unix://$SPICE_SOCK" 2>&1 &
-            fi
-            exit 0
-        else
+        running_pid=$(cat "$PID_FILE" 2>/dev/null || as_root cat "$PID_FILE")
+        if ! kill -0 "$running_pid" 2>/dev/null; then
             echo "Found stale PID file. Removing..."
-            rm "$PID_FILE"
+            as_root rm -f "$PID_FILE"
+            running_pid=""
         fi
     fi
+    # Fallback: check by process name (covers missing/deleted PID file)
+    if [ -z "$running_pid" ]; then
+        running_pid=$(pgrep -f 'qemu-system-x86_64.*-name windows' 2>/dev/null | head -1 || true)
+    fi
+    if [ -n "$running_pid" ]; then
+        if [ "$HEADLESS" -eq 0 ]; then
+            nohup remote-viewer --auto-resize=never "spice+unix://$SPICE_SOCK" 2>&1 >/dev/null &
+        else
+            echo "VM is already running (PID $running_pid)."
+        fi
+        exit 0
+    fi
+
+    detect_paths
+    check_deps
+    as_root mkdir -p "$RUN_DIR"
+    as_root chmod 755 "$RUN_DIR"
 
     # Determine mode
     FRESH_INSTALL=0
