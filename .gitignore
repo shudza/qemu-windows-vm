@@ -3,3 +3,4 @@ nohup.out
 smm/
 .claude/
 shared/
+.env

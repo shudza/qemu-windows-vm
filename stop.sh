@@ -3,9 +3,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-VM_DIR="$SCRIPT_DIR/windows"
-PID_FILE="$VM_DIR/windows.pid"
-MONITOR_SOCK="$VM_DIR/windows-monitor.socket"
+RUN_DIR="${XDG_RUNTIME_DIR:-/run}/windows-vm"
+PID_FILE="$RUN_DIR/qemu.pid"
+MONITOR_SOCK="$RUN_DIR/monitor.sock"
+VIRTIOFS_SOCK="$RUN_DIR/virtiofs.sock"
 TIMEOUT=10
 
 if [ ! -f "$PID_FILE" ]; then
@@ -36,11 +37,11 @@ for i in $(seq "$TIMEOUT"); do
     if ! kill -0 "$PID" 2>/dev/null; then
         echo "VM shut down gracefully."
         rm -f "$PID_FILE"
-        if pgrep -f "virtiofsd.*$VM_DIR" > /dev/null 2>&1; then
+        if pgrep -f virtiofsd > /dev/null 2>&1; then
             echo "Stopping virtiofsd..."
-            sudo pkill -f "virtiofsd.*$VM_DIR" 2>/dev/null || true
+            sudo pkill -f virtiofsd 2>/dev/null || true
         fi
-        rm -f "$VM_DIR/virtiofs-shared.sock"
+        rm -f "$VIRTIOFS_SOCK"
         exit 0
     fi
     sleep 1
@@ -52,9 +53,9 @@ kill -9 "$PID" 2>/dev/null || true
 rm -f "$PID_FILE"
 echo "VM force-killed."
 
-# ── Stop virtiofsd ────────────────────────────────────────────────
-if pgrep -f "virtiofsd.*$VM_DIR" > /dev/null 2>&1; then
+# Stop virtiofsd
+if pgrep -f virtiofsd > /dev/null 2>&1; then
     echo "Stopping virtiofsd..."
-    sudo pkill -f "virtiofsd.*$VM_DIR" 2>/dev/null || true
+    sudo pkill -f virtiofsd 2>/dev/null || true
 fi
-rm -f "$VM_DIR/virtiofs-shared.sock"
+rm -f "$VIRTIOFS_SOCK"
