@@ -413,6 +413,10 @@ launch_vm() {
     QEMU_STARTED=1
 }
 
+open_viewer() {
+    nohup env GDK_BACKEND=x11 remote-viewer "spice+unix://$SPICE_SOCK" 2>&1 >/dev/null &
+}
+
 launch_viewer() {
     if [ "$HEADLESS" -eq 1 ]; then
         return
@@ -424,7 +428,7 @@ launch_viewer() {
         sleep 0.5
     done
     if [ -S "$SPICE_SOCK" ]; then
-        nohup remote-viewer --auto-resize=never "spice+unix://$SPICE_SOCK" 2>&1 >/dev/null &
+        open_viewer
     else
         echo "Warning: SPICE socket not found after 5s. Check $LOG_FILE"
     fi
@@ -531,7 +535,7 @@ main() {
     fi
     if [ -n "$running_pid" ]; then
         if [ "$HEADLESS" -eq 0 ]; then
-            nohup remote-viewer --auto-resize=never "spice+unix://$SPICE_SOCK" 2>&1 >/dev/null &
+            open_viewer
         else
             echo "VM is already running (PID $running_pid)."
         fi
