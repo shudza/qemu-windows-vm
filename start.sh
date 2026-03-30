@@ -7,6 +7,7 @@ SMP="cores=4,threads=1,sockets=1"
 MEM="8G"
 HUGEPAGES_COUNT=4096
 CPU_PINNING="0-3"
+CPU_ARGS=""
 SMB_PATH=""
 VIRTIOFS_SHARED="$SCRIPT_DIR/shared"
 HOST_FORWARDS=""
@@ -260,7 +261,7 @@ build_qemu_cmd() {
         -machine q35,hpet=off,smm=off,vmport=off,accel=kvm
         -global kvm-pit.lost_tick_policy=discard
         -global ICH9-LPC.disable_s3=1
-        -cpu host,+hypervisor,+invtsc,l3-cache=on,migratable=no,hv_passthrough
+        -cpu ${CPU_ARGS:-host,+hypervisor,+invtsc,l3-cache=on,migratable=no,hv_passthrough}
         -smp "$SMP"
     )
 
