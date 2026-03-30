@@ -232,7 +232,7 @@ setup_hugepages() {
 
 start_virtiofsd() {
     mkdir -p "$VIRTIOFS_SHARED"
-    as_root rm -f "$VIRTIOFS_SOCK"
+    rm -f "$VIRTIOFS_SOCK"
     as_root "$VIRTIOFSD_BIN" \
         --socket-path="$VIRTIOFS_SOCK" \
         --shared-dir="$VIRTIOFS_SHARED" \
@@ -401,16 +401,10 @@ launch_vm() {
         exit 1
     fi
 
-    # Grant the real user access to the SPICE socket
-    for i in $(seq 20); do
-        [ -S "$SPICE_SOCK" ] && break
-        sleep 0.25
-    done
-    if [ -S "$SPICE_SOCK" ]; then
-        as_root chown "$REAL_USER" "$SPICE_SOCK"
-    fi
-
     QEMU_STARTED=1
+
+    # Fix socket ownership so non-root users can connect (e.g. viewer after systemd start)
+    as_root chown "$REAL_USER" "$RUN_DIR"/* 2>/dev/null || true
 }
 
 open_viewer() {
@@ -511,7 +505,7 @@ cleanup() {
     if [ "$QEMU_STARTED" -eq 0 ] && [ -n "$VIRTIOFSD_PID" ]; then
         echo "QEMU failed to start. Cleaning up virtiofsd..."
         as_root kill "$VIRTIOFSD_PID" 2>/dev/null || true
-        as_root rm -f "$VIRTIOFS_SOCK"
+        rm -f "$VIRTIOFS_SOCK"
     fi
 }
 
@@ -522,10 +516,10 @@ main() {
     # If already running, just open the viewer
     local running_pid=""
     if [ -f "$PID_FILE" ]; then
-        running_pid=$(cat "$PID_FILE" 2>/dev/null || as_root cat "$PID_FILE")
-        if ! kill -0 "$running_pid" 2>/dev/null; then
+        running_pid=$(cat "$PID_FILE" 2>/dev/null || true)
+        if [ -n "$running_pid" ] && ! kill -0 "$running_pid" 2>/dev/null; then
             echo "Found stale PID file. Removing..."
-            as_root rm -f "$PID_FILE"
+            rm -f "$PID_FILE"
             running_pid=""
         fi
     fi
@@ -545,7 +539,7 @@ main() {
     detect_paths
     check_deps
     as_root mkdir -p "$RUN_DIR"
-    as_root chmod 755 "$RUN_DIR"
+    as_root chown "$REAL_USER" "$RUN_DIR"
 
     # Determine mode
     FRESH_INSTALL=0
