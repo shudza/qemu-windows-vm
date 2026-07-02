@@ -5,7 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # ── Defaults (overridden by .env, then CLI args) ─────────────────
 SMP="cores=4,threads=1,sockets=1"
 MEM="8G"
-HUGEPAGES_COUNT=4096
+HUGEPAGES=0
+HUGEPAGES_COUNT=""
 CPU_PINNING="0-3"
 CPU_ARGS=""
 SMB_PATH=""
@@ -31,10 +32,15 @@ DISK="$VM_DIR/disk.qcow2"
 
 # ── Runtime state ─────────────────────────────────────────────────
 HEADLESS=0
+DESKTOP=0
 QEMU_STARTED=0
 VIRTIOFSD_PID=""
 ISO_PATH=""
 VIRTIO_ISO=""
+USE_HUGEPAGES=0
+HUGEPAGES_BASELINE=0
+HUGEPAGES_ALLOCATED=0
+NR_HUGEPAGES=/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
 # Real user — for socket ownership (works through sudo and systemd)
 REAL_USER="${SUDO_USER:-$(stat -c %U "$HOME")}"
 
@@ -57,6 +63,18 @@ parse_args() {
                 HEADLESS=1
                 shift
                 ;;
+            --hugepages)
+                HUGEPAGES=1
+                shift
+                ;;
+            --no-hugepages)
+                HUGEPAGES=0
+                shift
+                ;;
+            --desktop)
+                DESKTOP=1
+                shift
+                ;;
             --install-desktop)
                 install_desktop
                 echo "Desktop file installed."
@@ -72,6 +90,9 @@ Usage: start.sh [OPTIONS] [windows.iso] [virtio-win.iso]
 
 Options:
   --headless          Launch VM without SPICE viewer
+  --hugepages         Back VM memory with 2MB hugepages (released when VM exits)
+  --no-hugepages      Disable hugepages (overrides HUGEPAGES=1 from .env)
+  --desktop           Desktop launcher mode: start via systemd with GUI prompts
   --install-desktop   Install .desktop file and exit
   --systemd           Install systemd service and exit
   --help, -h          Show this help
@@ -212,23 +233,48 @@ check_deps() {
     fi
 }
 
+hugepages_needed() {
+    local mb
+    case "$MEM" in
+        *G|*g) mb=$(( ${MEM%[Gg]} * 1024 )) ;;
+        *M|*m) mb=${MEM%[Mm]} ;;
+        *)     mb=$MEM ;;
+    esac
+    echo $(( mb / 2 ))
+}
+
 setup_hugepages() {
-    local current
-    current=$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages)
-    if [ "$current" -lt "$HUGEPAGES_COUNT" ]; then
-        echo "Allocating $HUGEPAGES_COUNT hugepages..."
-        echo "$HUGEPAGES_COUNT" | as_root tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages > /dev/null
-        local actual
-        actual=$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages)
-        if [ "$actual" -lt "$HUGEPAGES_COUNT" ]; then
-            echo "Warning: Only got $actual/$HUGEPAGES_COUNT hugepages. Continuing without hugepages."
-            USE_HUGEPAGES=0
-        else
-            USE_HUGEPAGES=1
-        fi
+    local count="${HUGEPAGES_COUNT:-$(hugepages_needed)}"
+    HUGEPAGES_BASELINE=$(cat "$NR_HUGEPAGES")
+    if [ "$HUGEPAGES_BASELINE" -ge "$count" ]; then
+        USE_HUGEPAGES=1
+        return
+    fi
+    echo "Allocating $count hugepages..."
+    echo "$count" | as_root tee "$NR_HUGEPAGES" > /dev/null
+    local actual
+    actual=$(cat "$NR_HUGEPAGES")
+    if [ "$actual" -lt "$count" ]; then
+        echo "Warning: Only got $actual/$count hugepages. Continuing without hugepages."
+        echo "$HUGEPAGES_BASELINE" | as_root tee "$NR_HUGEPAGES" > /dev/null
+        USE_HUGEPAGES=0
     else
         USE_HUGEPAGES=1
+        HUGEPAGES_ALLOCATED=1
     fi
+}
+
+# QEMU exiting on guest-initiated shutdown bypasses stop.sh, so hugepages
+# would stay allocated forever. Watch the QEMU PID from a detached root
+# process and restore the pre-VM count once it exits, whatever the cause.
+start_hugepages_reaper() {
+    [ "$HUGEPAGES_ALLOCATED" -eq 1 ] || return 0
+    local qemu_pid
+    qemu_pid=$(cat "$PID_FILE")
+    as_root nohup bash -c "
+        tail --pid=$qemu_pid -f -s 1 /dev/null
+        echo $HUGEPAGES_BASELINE > $NR_HUGEPAGES
+    " > /dev/null 2>&1 &
 }
 
 start_virtiofsd() {
@@ -429,6 +475,28 @@ launch_viewer() {
     fi
 }
 
+desktop_notify() {
+    echo "$1" >&2
+    if command -v notify-send &>/dev/null; then
+        notify-send -a "Windows VM" "Windows VM" "$1"
+    fi
+}
+
+# .desktop launches have no terminal, so sudo can't prompt and the script
+# used to die silently. Start via systemd instead: systemctl asks for
+# authorization through the polkit GUI agent, and failures get a notification.
+desktop_start() {
+    if [ ! -f /etc/systemd/system/windows-vm.service ]; then
+        desktop_notify "The windows-vm service is not installed. Run './start.sh --systemd' from a terminal first."
+        exit 1
+    fi
+    if ! systemctl start windows-vm.service; then
+        desktop_notify "Failed to start the VM. Check: journalctl -u windows-vm"
+        exit 1
+    fi
+    launch_viewer
+}
+
 install_desktop() {
     local desktop_dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
     local desktop_file="$desktop_dir/windows-vm.desktop"
@@ -437,12 +505,15 @@ install_desktop() {
 [Desktop Entry]
 Name=Windows
 Comment=Windows QEMU VM
-Exec=$SCRIPT_DIR/start.sh
+Exec=$SCRIPT_DIR/start.sh --desktop
 Icon=preferences-desktop-display
 Terminal=false
 Type=Application
 Categories=System;Emulator;
 EOF
+    # Bumping the dir mtime is the XDG-portable signal for menu caches
+    # (KDE sycoca, GNOME Shell, ...) to pick up the changed Exec line
+    touch "$desktop_dir"
     echo "Installed $desktop_file"
 }
 
@@ -508,11 +579,34 @@ cleanup() {
         as_root kill "$VIRTIOFSD_PID" 2>/dev/null || true
         rm -f "$VIRTIOFS_SOCK"
     fi
+    if [ "$QEMU_STARTED" -eq 0 ] && [ "$HUGEPAGES_ALLOCATED" -eq 1 ]; then
+        echo "Releasing hugepages..."
+        echo "$HUGEPAGES_BASELINE" | as_root tee "$NR_HUGEPAGES" > /dev/null
+    fi
 }
 
 main() {
     load_env
     parse_args "$@"
+
+    # Stale .desktop entries may still launch without --desktop; when there
+    # is no terminal to prompt for sudo but a display for polkit/notifications,
+    # fall back to desktop mode instead of dying silently on the first sudo
+    if [ "$DESKTOP" -eq 0 ] && [ "$HEADLESS" -eq 0 ] \
+        && [ ! -t 0 ] && [ ! -t 2 ] \
+        && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] \
+        && [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
+        DESKTOP=1
+    fi
+
+    # No terminal in .desktop launches — capture output and turn any
+    # unexpected set -e death into a notification instead of a silent exit
+    if [ "$DESKTOP" -eq 1 ]; then
+        DESKTOP_LOG="${XDG_CACHE_HOME:-$HOME/.cache}/windows-vm-desktop.log"
+        exec > "$DESKTOP_LOG" 2>&1
+        set -o errtrace
+        trap 'desktop_notify "Unexpected error at line $LINENO. See $DESKTOP_LOG"' ERR
+    fi
 
     # If already running, just open the viewer
     local running_pid=""
@@ -534,6 +628,11 @@ main() {
         else
             echo "VM is already running (PID $running_pid)."
         fi
+        exit 0
+    fi
+
+    if [ "$DESKTOP" -eq 1 ]; then
+        desktop_start
         exit 0
     fi
 
@@ -579,14 +678,17 @@ main() {
         exit 1
     fi
 
-    setup_hugepages
-
-    # Set trap before starting virtiofsd
+    # Set trap before allocating hugepages / starting virtiofsd
     trap cleanup EXIT SIGTERM SIGINT
+
+    if [ "$HUGEPAGES" -eq 1 ]; then
+        setup_hugepages
+    fi
 
     start_virtiofsd
     build_qemu_cmd
     launch_vm
+    start_hugepages_reaper
     launch_viewer
 
     echo "VM launched in background. Logs: $LOG_FILE"

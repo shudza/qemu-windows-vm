@@ -12,7 +12,7 @@ Effortless Windows VM on Linux. Two scripts, one `.env` file, no XML — just `.
 - **UEFI boot** via OVMF with Q35 chipset
 - **SPICE display** with clipboard sharing, USB redirection, and smartcard passthrough
 - **VirtioFS** shared folder between host and guest
-- **Hugepages** for memory performance
+- **Hugepages** on demand (`--hugepages`), auto-released when the VM exits
 - **CPU pinning** to dedicated cores
 - **Distro-agnostic** — auto-detects OVMF and virtiofsd paths across Arch, Fedora, Ubuntu, etc.
 - **Systemd service** — optional, for headless/autostart setups
@@ -86,7 +86,8 @@ cp .env.example .env
 |-|-|-|
 | `SMP` | `cores=4,threads=1,sockets=1` | CPU topology |
 | `MEM` | `8G` | RAM allocation |
-| `HUGEPAGES_COUNT` | `4096` | 2MB hugepages (must match MEM) |
+| `HUGEPAGES` | `0` | Set to `1` to back VM memory with 2MB hugepages |
+| `HUGEPAGES_COUNT` | *(auto)* | Override page count (default: `MEM` / 2MB) |
 | `CPU_PINNING` | `0-3` | CPU cores to pin to (empty to disable) |
 | `DISK_SIZE` | `100G` | Disk size (only used on first run) |
 | `SMB_PATH` | *(empty)* | Directory to share via QEMU SMB |
@@ -115,6 +116,8 @@ journalctl -u windows-vm
 
 The VM starts headless. Use `./start.sh` to open a viewer window while the service is running.
 
+The desktop entry starts the VM through this service: since app-menu launches have no terminal for a sudo prompt, `systemctl start` is used instead, which asks for authorization via the polkit GUI dialog. If the start fails (or the service isn't installed), a desktop notification tells you why.
+
 ## CLI Reference
 
 ```
@@ -122,10 +125,19 @@ The VM starts headless. Use `./start.sh` to open a viewer window while the servi
 
 Options:
   --headless          Launch VM without SPICE viewer
+  --hugepages         Back VM memory with 2MB hugepages (released when VM exits)
+  --no-hugepages      Disable hugepages (overrides HUGEPAGES=1 from .env)
+  --desktop           Desktop launcher mode: start via systemd with GUI prompts
   --install-desktop   Install .desktop file and exit
   --systemd           Install systemd service and exit
   --help, -h          Show this help
 ```
+
+## Hugepages
+
+Hugepages are off by default. Enable them per-run with `--hugepages`, or permanently with `HUGEPAGES=1` in `.env`. The page count is derived from `MEM` automatically (`HUGEPAGES_COUNT` overrides it).
+
+Allocated pages are restored to their previous count when the VM exits — including shutdowns initiated from inside the guest — so they don't stay pinned after the VM is gone.
 
 ## File Layout
 
